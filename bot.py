@@ -1,11 +1,12 @@
 import os
 import json
-import threading
 from datetime import datetime
-from flask import Flask
-from aiogram import Bot, Dispatcher, types
-from aiogram.utils import executor
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.filters import Command
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
@@ -13,22 +14,17 @@ if not TOKEN:
     exit(1)
 
 bot = Bot(token=TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher(storage=MemoryStorage())
 
-# Главное меню
-main_kb = ReplyKeyboardMarkup(resize_keyboard=True)
-main_kb.add(KeyboardButton("Начать работу"))
-main_kb.add(KeyboardButton("Мой отчёт за сегодня"))
-main_kb.add(KeyboardButton("Завершить день"))
-
-# Список проектов
+DATA_FILE = "sessions.json"
 PROJECTS = ["Проект А", "Проект Б", "Внутренние задачи"]
 
-# Активные сессии {user_id: {project, start_time}}
-active_sessions = {}
-
-# Файл для хранения сессий
-DATA_FILE = "sessions.json"
+# Главное меню
+kb_builder = ReplyKeyboardBuilder()
+kb_builder.add(KeyboardButton(text="Начать работу"))
+kb_builder.add(KeyboardButton(text="Мой отчёт за сегодня"))
+kb_builder.add(KeyboardButton(text="Завершить день"))
+main_kb = kb_builder.as_markup(resize_keyboard=True)
 
 # Сохранение сессии
 def save_session(user_id, project, start_time):
@@ -54,8 +50,7 @@ def end_session(user_id):
     total_seconds = 0
     for session in data:
         if session["user_id"] == user_id and session["end_time"] is None:
-            session["end_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            # Подсчёт времени в секундах
+            session["end_time"] = datetime.now().isoformat(timespec='seconds')
             start_dt = datetime.fromisoformat(session["start_time"])
             end_dt = datetime.now()
             total_seconds += int((end_dt - start_dt).total_seconds())
@@ -65,67 +60,54 @@ def end_session(user_id):
 
 # Клавиатура проектов
 def project_keyboard():
-    kb = InlineKeyboardMarkup()
+    kb = InlineKeyboardBuilder()
     for p in PROJECTS:
-        kb.add(InlineKeyboardButton(text=p, callback_data=f"proj:{p}"))
-    return kb
+        kb.button(text=p, callback_data=f"proj:{p}")
+    return kb.as_markup()
 
-# Команды бота
-@dp.message_handler(commands=["start"])
-async def start_cmd(message: types.Message):
-    await message.answer(
-        "Привет 👋\nЯ помогу фиксировать твоё время по проектам.",
-        reply_markup=main_kb
-    )
+# Хендлеры
+@dp.message(Command("start"))
+async def start_cmd(msg: Message):
+    await msg.answer("Привет 👋\nЯ помогу фиксировать твоё время по проектам.", reply_markup=main_kb)
 
-@dp.message_handler(lambda msg: msg.text == "Начать работу")
-async def start_work(message: types.Message):
-    await message.answer("Выберите проект:", reply_markup=project_keyboard())
+@dp.message(F.text == "Начать работу")
+async def start_work(msg: Message):
+    await msg.answer("Выберите проект:", reply_markup=project_keyboard())
 
-@dp.callback_query_handler(lambda c: c.data.startswith("proj:"))
-async def process_project(callback: types.CallbackQuery):
+@dp.callback_query(lambda c: c.data.startswith("proj:"))
+async def process_project(callback):
     project = callback.data.split(":", 1)[1]
     user_id = callback.from_user.id
     start_time = datetime.now().isoformat(timespec='seconds')
-    active_sessions[user_id] = {"project": project, "start_time": start_time}
     save_session(user_id, project, start_time)
-    await callback.answer(f"Начал работу над '{project}'")
     await callback.message.edit_text(f"✅ Сейчас работаешь над '{project}' с {start_time}")
+    await callback.answer()
 
-@dp.message_handler(lambda msg: msg.text == "Мой отчёт за сегодня")
-async def today_report(message: types.Message):
+@dp.message(F.text == "Мой отчёт за сегодня")
+async def today_report(msg: Message):
     if not os.path.exists(DATA_FILE):
-        await message.answer("Данных пока нет.")
+        await msg.answer("Данных пока нет.")
         return
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
-    user_sessions = [s for s in data if s["user_id"] == message.from_user.id]
+    user_sessions = [s for s in data if s["user_id"] == msg.from_user.id]
     if not user_sessions:
-        await message.answer("Ты ещё не начинал работу сегодня.")
+        await msg.answer("Ты ещё не начинал работу сегодня.")
         return
     report = ""
     for s in user_sessions:
         report += f"{s['project']}: {s['start_time']} — {s.get('end_time','В процессе')}\n"
-    await message.answer(report)
+    await msg.answer(report)
 
-@dp.message_handler(lambda msg: msg.text == "Завершить день")
-async def finish_day(message: types.Message):
-    user_id = message.from_user.id
+@dp.message(F.text == "Завершить день")
+async def finish_day(msg: Message):
+    user_id = msg.from_user.id
     total_seconds = end_session(user_id)
     hours = total_seconds // 3600
     minutes = (total_seconds % 3600) // 60
-    await message.answer(f"✅ День завершён. Всего отработано: {hours} ч {minutes} мин.")
+    await msg.answer(f"✅ День завершён. Всего отработано: {hours} ч {minutes} мин.")
 
-# Web-сервер для Render health-check
-def run_web():
-    app = Flask(__name__)
-    @app.route("/")
-    def index():
-        return "OK"
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-
+# Запуск бота
 if __name__ == "__main__":
-    t = threading.Thread(target=run_web)
-    t.start()
-    executor.start_polling(dp, skip_updates=True)
+    import asyncio
+    asyncio.run(dp.start_polling(bot))
